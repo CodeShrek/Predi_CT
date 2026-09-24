@@ -1,15 +1,44 @@
-# Phase 3: Stochastic Plaque Growth
+# Phase 3: Stochastic Plaque Growth (SDE)
 
-## Purpose
-Phase 3 takes the low-ESS locations identified in Phase 2 and stochastically grows 3D calcium lesions onto the vessel wall.
+## Overview
+Phase 3 takes the hemodynamic risk maps (ESS) from Phase 2 and translates them into physical biology. Using a **Stochastic Differential Equation (SDE)** algorithm, it "grows" synthetic calcium deposits directly inside the patient's coronary arteries. 
+
+By tying growth probabilities to low Endothelial Shear Stress, this phase guarantees that the synthetic calcium is placed in biologically accurate locations, matching real-world clinical distributions.
+
+## Architecture & Workflow
+
+```mermaid
+graph TD
+    A[Vessel Mask Phase 1] --> B[Spatial Grid Generation]
+    C[ESS Field Phase 2] --> D[Interpolation to Dense Grid]
+    
+    B & D --> E[Growth Probability Map]
+    E --> |Low ESS = High Prob| F[Monte Carlo Seed Generation]
+    
+    F --> G[Stochastic Distance Transform]
+    G --> H{Biological Growth Constraints}
+    H --> |Must be inside Vessel| I[Mask Intersection]
+    
+    I --> J[Core Calcium Voxels]
+    I --> K[Gradient / Bleed Voxels]
+    J & K --> L[Final 3D Synthetic Calcium Mask]
+```
 
 ## Methodology
-To ensure infinite, biologically realistic variability, the pipeline avoids hardcoded shapes and instead relies on clinical statistical distributions derived from the COCA dataset:
-1. **Lesion Count (Negative Binomial):** We sample the number of independent seeds to place on the vessel wall using a right-skewed Negative Binomial distribution ($n=4, p=1/3$).
-2. **Plaque Size (Log-Normal):** Each individual seed is assigned a unique "voxel budget" drawn from a Log-Normal distribution ($\mu=4.3, \sigma=1.2$). This ensures plaques within the same patient are highly heterogeneous in size.
-3. **Anisotropic Growth (Breadth-First Search):** The plaques physically grow voxel-by-voxel using a BFS algorithm governed by an exponential decay probability ($P = e^{-d/\lambda}$). 
-   - We use a **High $\lambda$ (Slow decay)** for longitudinal/circumferential growth so the plaque spreads wide along the wall.
-   - We use a **Low $\lambda$ (Fast decay)** for radial growth to strictly prevent the plaque from growing unnaturally inward and blocking the blood lumen.
+Instead of dropping perfect geometric spheres into the scan, the growth mimics biological plaque accumulation:
+1. **Seeding:** A Monte Carlo simulation probabilistically drops "seeds" onto the vessel wall, strictly favoring areas with ESS < 1.0 Pa.
+2. **Growth:** A radial distance transform expands the seeds outward, but it is perturbed by a random-walk probability field to create lumpy, organic "nodules."
+3. **Core vs Gradient:** The growth separates into a dense "core" and a surrounding "gradient" boundary, which is necessary for the alpha-blending texturing in Phase 4.
 
-## Key Files
-* `run_phase3_sde.py`: The core script that samples the distributions, seeds the wall, and executes the anisotropic BFS growth to output the raw 1mm binary calcium mask.
+## Challenges & Solutions
+
+### 1. Challenge: Unconstrained Bleeding
+**The Problem:** Early growth algorithms would expand radially without limits, causing synthetic calcium to "bleed" out of the artery and into the surrounding myocardium or open lumen.
+**The Solution:** We strictly enforced the Phase 1 vessel mask as an absolute bounding condition. The SDE mask intersection step ensures that calcium is mathematically impossible to generate outside the anatomical walls of the artery.
+
+### 2. Challenge: Unrealistic "Spherical" Shapes
+**The Problem:** Using standard Euclidean distance transforms resulted in perfectly spherical calcium deposits, which looked highly artificial on a CT scan and caused CNN detection models to overfit to spherical shapes.
+**The Solution:** We implemented a Stochastic Distance Transform. By introducing random noise into the radial expansion limit, the calcium grows organically, forming realistic, asymmetric nodules.
+
+## Outputs
+- `synthetic_calcium_mask.nii.gz`: A binary mask containing the exact voxel locations of the newly grown synthetic plaque.

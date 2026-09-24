@@ -1,22 +1,44 @@
-# Phase 4: Texturing & Alpha Blending
+# Phase 4: Physiological Texturing
 
-## Purpose
-Phase 4 transforms the raw, blocky binary calcium mask from Phase 3 into photorealistic, sub-voxel synthetic CT anatomy.
+## Overview
+Phase 4 is the final stage of the Physio-Twin pipeline. It takes the spatial calcium mask generated in Phase 3 and projects it into the radiometric space of a Non-Contrast CT (NCCT) scan. 
+
+By mapping the synthetic voxels to precise Hounsfield Units (HU) and seamlessly blending them into the native tissue, this phase produces the final, photorealistic synthetic patient scan, complete with a computed clinical Agatston Score.
+
+## Architecture & Workflow
+
+```mermaid
+graph TD
+    A[Patient NCCT Scan] --> B[HU Voxel Grid]
+    C[Synthetic Calcium Mask Phase 3] --> D[Core vs Gradient Separation]
+    
+    B & D --> E[Hounsfield Unit Sampling]
+    E --> F[Core Assignment mean ~ 900 HU]
+    E --> G[Alpha-Blending Degrading Function]
+    
+    F & G --> H[Merged Radiometric Grid]
+    H --> I[Gaussian Blur Anti-Aliasing]
+    I --> J[Final Synthetic NCCT Scan]
+    
+    J --> K[Agatston Score Computation]
+    K --> L[Score Output Validation]
+```
 
 ## Methodology
-Raw voxel generation suffers from harsh "staircase" pixelation on a CT grid. We resolve this using a two-step texturing and blending process:
+The algorithm analyzes the intensity distribution of real clinical calcium (usually ranging between 130 HU and 1400+ HU). 
+1. **Core Assignment:** The deep interior voxels of the synthetic plaque are assigned high, rigid HU values matching dense calcification.
+2. **Alpha-Blending:** The outer gradient voxels are continuously blended with the native tissue's HU values using a degrading function.
+3. **Agatston Scoring:** The system automatically sweeps the newly generated scan to compute the clinical Agatston score, validating that the synthetic generation met the user's targeted score requirement.
 
-1. **CT Texture Generation (Normal Distributions):**
-   - Each patient draws a baseline Hounsfield Unit (HU) density from a Normal distribution ($\mu=850, \sigma=100$) calibrated for Contrast-Enhanced CT (CCTA) visibility.
-   - Within each plaque, every individual voxel draws a variance from a secondary Normal distribution ($\mu=150, \sigma=30$) to perfectly simulate internal CT quantum noise and tissue heterogeneity.
+## Challenges & Solutions
 
-2. **Dual-Stage Alpha Blending (Blooming Artifact):**
-   - We apply a coarse Gaussian blur ($\sigma=0.8$mm) on the 1mm grid to establish a fading intensity gradient.
-   - We apply an ultra-fine Gaussian blur ($\sigma=0.6$mm) on the resampled 0.375mm native CT grid to act as a flawless anti-aliasing filter.
-   - This blurred spatial gradient is then used as an **Alpha Channel** to mathematically mix the intense calcium brightness with the underlying heart tissue.
+### 1. Challenge: "Pasted-On" Artifacts
+**The Problem:** Initial texturing attempts simply overwrote the CT pixels with 1000 HU. This caused the calcium to look like it was artificially pasted on, creating harsh, aliased boundaries that Convolutional Neural Networks (CNNs) could instantly identify as fake.
+**The Solution:** We implemented a continuous **Alpha-Blending Degrading Function**. The outer boundary of the synthetic calcium smoothly averages its HU values with the underlying native tissue, mimicking the partial-volume effect seen in real CT scanners. A final Gaussian blur anti-aliases the sub-voxel boundaries.
 
-## Result
-The hard edges vanish. The solid calcium core degrades organically outward into the surrounding tissue, perfectly replicating the natural blooming artifact produced by the Point Spread Function (PSF) of clinical CT scanners.
+### 2. Challenge: Agatston Score Tuning
+**The Problem:** It was difficult to predictably generate a specific Agatston score (e.g., exactly 400) because the Agatston algorithm weights different HU densities non-linearly (130-199=1, 200-299=2, 300-399=3, 400+=4).
+**The Solution:** By tuning the Monte Carlo seed count in Phase 3 and strictly constraining the mean HU distribution in Phase 4 to ~927 HU (with a standard deviation of 135), the pipeline consistently hits the high-density multiplier (4x), making the Agatston score a direct, predictable function of voxel volume.
 
-## Key Files
-* `run_phase4_texture.py`: The execution script that applies the dual-stage Gaussian blurs, generates the statistical HU noise, and blends the final synthetic calcium directly into the patient's original CT scan.
+## Outputs
+- `synthetic_coca.nii.gz`: The final photorealistic, fully simulated Non-Contrast CT scan containing the synthetic atherosclerotic plaque.
