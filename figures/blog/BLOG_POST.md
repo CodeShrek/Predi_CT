@@ -1,4 +1,4 @@
-# PrediCT: A Physics-Informed Digital Twin for Synthetic Coronary Artery Calcium Generation
+# PrediCT(Data Augmentation): A Physics-Informed Digital Twin for Synthetic Coronary Artery Calcium Generation
 
 ### Growing biologically realistic calcified plaque — inside a real patient's CT scan — using multi-atlas registration, Navier-Stokes PINNs, stochastic differential equations, and radiometric alpha-blending.
 
