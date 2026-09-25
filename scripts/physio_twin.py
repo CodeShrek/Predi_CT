@@ -250,7 +250,7 @@ def run_physio_twin(coca_patient_dir: Path, target_agatston: int, out_dir: Path,
     
     logger.info("Running PINN solver (Full Epochs)...")
     # Run run_phase2.py
-    # subprocess.run([sys.executable, "run_phase2.py"], env=env, check=True, cwd="src/phase2_hemodynamics")
+    subprocess.run([sys.executable, "run_phase2.py"], env=env, check=True, cwd="src/phase2_hemodynamics")
     
     # Look for the output
     # By default, run_phase2 writes to out_dir / ess_predictions.csv based on CFG

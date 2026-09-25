@@ -6,3 +6,7 @@ matplotlib
 pandas
 tqdm
 scikit-learn
+
+scikit-image
+nibabel
+pyvista

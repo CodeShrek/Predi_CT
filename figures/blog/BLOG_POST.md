@@ -107,6 +107,8 @@ If these checks fail, Phase 1 raises a `RuntimeError` and aborts the run, preven
 
 ## Phase 2 — Hemodynamic Surrogate: Solving Navier-Stokes with a Neural Network
 
+![Phase 2 Flowchart](03b_phase2_pinn_flowchart.jpg)
+
 This is the most technically complex phase of the pipeline, and the one that most directly grounds PrediCT in physical reality.
 
 ### Why Not Standard CFD?
@@ -122,43 +124,7 @@ This is completely intractable at scale — you cannot run traditional CFD on hu
 
 The hemodynamic surrogate is a **fully-connected Physics-Informed Neural Network (PINN)** that learns the mapping from spatial coordinates to flow variables directly, without ever being given labelled training data.
 
-```
-Input Layer
-┌─────────────────────────────────────┐
-│  x*, y*, z*  (non-dim coordinates)  │  ← 3 neurons
-└──────────────────┬──────────────────┘
-                   │
-         ┌─────────▼──────────┐
-         │  Hidden Layer 1    │  ← 128 neurons, Tanh activation
-         │  W₁, b₁            │
-         └─────────┬──────────┘
-                   │
-         ┌─────────▼──────────┐
-         │  Hidden Layer 2    │  ← 128 neurons, Tanh activation
-         │  W₂, b₂            │
-         └─────────┬──────────┘
-                   │
-         ┌─────────▼──────────┐
-         │  Hidden Layer 3    │  ← 128 neurons, Tanh activation
-         │  W₃, b₃            │
-         └─────────┬──────────┘
-                   │
-         ┌─────────▼──────────┐
-         │  Hidden Layer 4    │  ← 128 neurons, Tanh activation
-         │  W₄, b₄            │
-         └─────────┬──────────┘
-                   │
-         ┌─────────▼──────────┐
-         │  Hidden Layer 5    │  ← 64 neurons, Tanh activation
-         │  W₅, b₅            │
-         └─────────┬──────────┘
-                   │
-Output Layer
-┌─────────────────────────────────────┐
-│   u*, v*, w*    (velocity field)    │  ← 3 neurons (non-dim)
-│   p*            (pressure field)    │  ← 1 neuron  (non-dim)
-└─────────────────────────────────────┘
-```
+![PINN Architecture](03_phase2_pinn_architecture.jpg)
 
 **Why Tanh activations?** The network must compute second-order spatial derivatives via autograd (for the Laplacian terms in the viscous stress). Tanh is twice-differentiable and well-conditioned for this purpose. ReLU activations produce zero second derivatives almost everywhere and were tested — they caused complete loss convergence failure.
 
@@ -207,7 +173,7 @@ At vessel outlets, we enforce a zero-gradient (fully-developed flow) condition:
 ![Equation](equations/eq_07.png)
 
 The **total weighted loss** is:
-![Equation](equations/eq_03.png)
+![Equation](equations/eq_08.png)
 
 All $\lambda$ weights are set to 1.0 — equal weighting was found to be more stable than manual tuning during our experimentation.
 
@@ -373,9 +339,13 @@ This single line is the biological hard constraint that makes PrediCT physically
 
 **Phase 3 Output:** `{patient_id}_synthetic_calcium_mask.nii.gz` — a multi-label NIfTI with label 1 (core) and label 2 (gradient) voxels.
 
+![Phase 3 Growth Results](06_phase3_sde_growth.png)
+
 ---
 
 ## Phase 4 — Physiological Texturing: Making the CT Look Real
+
+![Phase 4 Texture Flowchart](07b_phase4_texture_flowchart.jpg)
 
 ### Hounsfield Unit Calibration
 
@@ -433,6 +403,8 @@ The computed score is logged alongside the target score. The ratio serves as a k
 ---
 
 ## End-to-End Validation Results
+
+![Results Before/After CT](08_results_before_after_ct.jpg)
 
 ### Pipeline Run: Patient `02b52e3578fc` (COCA Dataset)
 
