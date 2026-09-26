@@ -175,7 +175,7 @@ At vessel outlets, we enforce a zero-gradient (fully-developed flow) condition:
 The **total weighted loss** is:
 ![Equation](equations/eq_08.png)
 
-All $\lambda$ weights are set to 1.0 — equal weighting was found to be more stable than manual tuning during our experimentation.
+The $\lambda$ weights are tuned per-term: $\lambda_{continuity} = 10$, $\lambda_{momentum} = 1$, $\lambda_{wall} = 10$, $\lambda_{inlet} = 500$ (high to prevent trivial solution collapse), $\lambda_{outlet} = 1$, and $\lambda_{integral\_mass} = 50$.
 
 ### Collocation Point Sampling
 
@@ -183,18 +183,18 @@ The network is trained not on a fixed mesh, but on randomly sampled **collocatio
 
 | Region | Count | Sampling Method |
 |---|---|---|
-| **Interior** | 8,000 pts | Uniform random inside vessel mask |
-| **Wall** | 5,000 pts | Surface voxel boundary detection |
-| **Inlet** | 512 pts | Circular disk at aortic ostium |
-| **Outlet** | 512 pts/outlet | Circular disk at each branch termination |
+| **Interior** | 4,000 pts | Uniform random inside vessel mask |
+| **Wall** | 2,000 pts | Surface voxel boundary detection |
+| **Inlet** | 500 pts | Circular disk at aortic ostium |
+| **Outlet** | 500 pts/outlet | Circular disk at each branch termination |
 
-The wall count was increased from 2,000 to 5,000 and interior from 3,000 to 8,000 during development after discovering that ESS computation was undersampling the boundary layer — the thin region near the wall where velocity gradients are steepest.
+During development, the collocation counts were tuned upward from initial lower values after discovering that ESS computation was undersampling the boundary layer — the thin region near the wall where velocity gradients are steepest.
 
 ### Optimization
 
-Training uses the **Adam optimizer** with an initial learning rate of $1 \times 10^{-3}$. A cosine annealing scheduler reduces the learning rate over the training cycle. **Early stopping** is triggered if the best validation loss does not improve over 5,000 consecutive epochs, preventing unnecessary computation.
+Training uses the **Adam optimizer** with an initial learning rate of $1 \times 10^{-3}$. A `ReduceLROnPlateau` scheduler decays the learning rate when the loss plateaus. **Early stopping** is triggered if the best validation loss does not improve over 5,000 consecutive epochs, preventing unnecessary computation.
 
-A typical training run converges in approximately 9,700–10,000 epochs (~97 minutes on Apple M-series silicon). The best-loss checkpoint is automatically restored before ESS computation.
+Training time varies by patient geometry.
 
 ### Computing Endothelial Shear Stress
 
@@ -210,7 +210,7 @@ where $\mu = 3.5 \times 10^{-3}$ Pa·s is blood dynamic viscosity. The viscous s
 
 ![Equation](equations/eq_11.png)
 
-This is computed via PyTorch `vmap`-accelerated batched Jacobian over all wall points simultaneously.
+This is computed via PyTorch `torch.autograd.grad` over all wall points simultaneously.
 
 ### Engineering Challenges & Solutions
 
@@ -233,7 +233,7 @@ The PINN repeatedly discovered that predicting $\mathbf{u}^* = 0$ everywhere was
 
 **Fix 1 — Inlet Dirichlet Enforcement:** Strongly enforcing the parabolic inlet profile with $\lambda_{inlet} = 1.0$ prevents the zero-velocity collapse at the inlet boundary, forcing the network to propagate non-zero flow into the domain.
 
-**Fix 2 — Velocity Collapse Detection Gate:** After training, the pipeline evaluates the mean velocity magnitude across the interior. If $|\mathbf{u}^*|_{mean} < 1 \times 10^{-3}$, a `RuntimeError` is raised:
+**Fix 2 — Velocity Collapse Detection Gate:** After training, the pipeline evaluates the mean velocity magnitude across the interior. If $|\mathbf{u}^*|_{mean} < 1 \times 10^{-2}$, a `RuntimeError` is raised:
 ```
 CRITICAL: PINN velocity field has collapsed to trivial solution.
 Training failed to converge to a physical solution.
@@ -261,7 +261,7 @@ Phase 2 has three hard physiological safety gates before ESS export:
 
 | Gate | Check | Threshold | Failure Action |
 |---|---|---|---|
-| **Velocity Collapse** | $|\mathbf{u}^*|_{mean}$ | $> 1 \times 10^{-3}$ | Abort pipeline |
+| **Velocity Collapse** | $|\mathbf{u}^*|_{mean}$ | $> 1 \times 10^{-2}$ | Abort pipeline |
 | **Inlet Profile RMSE** | $RMSE(u_{pred}, u_{HP})$ | $< 0.05$ | Warning + continue |
 | **ESS Physiological Floor** | $\overline{ESS}_{wall}$ | $> 0.1$ Pa | Abort pipeline |
 | **Mass Conservation Error** | $|Q_{in} - Q_{out}| / Q_{in}$ | Logged | Warning only |
@@ -301,13 +301,15 @@ This ensures that deeply atherogenic regions (ESS < 0.5 Pa) have maximum growth 
 
 #### Step 3: Monte Carlo Seed Generation
 
-Using the growth probability map as a spatial probability distribution, the algorithm draws $N_{seeds}$ Monte Carlo samples to place **growth nucleation sites** on the vessel wall. The number of seeds is calibrated to the target Agatston score:
+Using the growth probability map as a spatial probability distribution, the algorithm draws $N_{seeds}$ Monte Carlo samples to place **growth nucleation sites** on the vessel wall. The number of seeds is drawn from a **negative binomial distribution** scaled by the target Agatston score:
 
 ```
-N_seeds ≈ target_agatston / 50   (empirically calibrated)
+scale_factor = max(1.0, target_agatston / 400.0)
+N_seeds = NegativeBinomial(n=adjusted_n, p=base_p)
+total_voxel_budget = target_agatston × 0.5
 ```
 
-For a target Agatston score of 400, approximately 8 seeds are dropped. Each seed is guaranteed to land in a high-ESS-risk region due to the probability-weighted sampling.
+The stochastic seed count ensures natural variation between runs. Each seed is guaranteed to land in a high-ESS-risk region due to the probability-weighted sampling.
 
 #### Step 4: Anisotropic Breadth-First Growth
 
@@ -318,14 +320,15 @@ From each seed, calcium "grows" outward using a **stochastic anisotropic breadth
 
 This produces the bumpy, heterogeneous, wall-hugging morphology characteristic of real calcified plaque.
 
-#### Step 5: Core vs. Gradient Separation
+#### Step 5: Continuous Intensity Gradient
 
-The growth mask is split into two layers based on distance from the seed:
+Rather than a binary core/gradient split, each calcium voxel receives a **continuous intensity value** derived from its BFS traversal depth. Voxels near the seed (depth ≈ 0) receive full intensity (~1.0), while voxels at the growth frontier decay exponentially:
 
-- **Core voxels** ($D < 0.6 \times MaxDepth$): Dense, high-HU calcium interior
-- **Gradient voxels** ($0.6 \times MaxDepth \leq D < MaxDepth$): Softer boundary region for alpha-blending
+```
+intensity(voxel) = exp(-bfs_depth / (max_bfs_depth × 0.5))
+```
 
-This separation is critical for Phase 4 to produce radiometrically realistic calcium with natural HU gradients instead of sharp artificial edges.
+This produces a smooth, natural HU gradient from the dense calcium core to the soft tissue boundary — critical for Phase 4 to produce radiometrically realistic calcium without sharp artificial edges.
 
 #### Step 6: Mask Intersection (Biological Hard Constraint)
 
@@ -339,7 +342,7 @@ This single line is the biological hard constraint that makes PrediCT physically
 
 **Note on Empirical Tuning:** While the plaque placement is guided by physical ESS boundaries, the seed counts (`N_seeds`) and maximum growth depths are empirically tuned to roughly target a desired Agatston score. This is a deliberate design choice to ensure clinical utility, acknowledging that biological simulation alone cannot deterministically predict exact clinical score thresholds without these tuning knobs.
 
-**Phase 3 Output:** `{patient_id}_synthetic_calcium_mask.nii.gz` — a multi-label NIfTI with label 1 (core) and label 2 (gradient) voxels.
+**Phase 3 Output:** `{patient_id}_synthetic_calcium_mask.nii.gz` — a NIfTI volume containing the binary calcium mask and an associated BFS depth field for intensity grading.
 
 ![Phase 3 Growth Results](06_phase3_sde_growth.png)
 
@@ -369,9 +372,9 @@ The Agatston scoring algorithm uses HU thresholds to assign density multipliers 
 
 For maximum score density, we want the majority of core calcium voxels in the ≥400 HU band. To match the natural variance seen in clinical data, the HU profile for each synthetic scan is dynamically sampled from a Gaussian distribution. For example, a typical generation might use:
 
-$$HU_{calcium} \sim \mathcal{N}(\mu=850,\ \sigma=150)$$
+$$\mu_{HU} \sim \mathcal{N}(850,\ 100), \quad \sigma_{HU} \sim \mathcal{N}(150,\ 30)$$
 
-This places the vast majority of generated HU values well above the 400 threshold (the 4x multiplier band) while providing the realistic intra-lesion heterogeneity found in real patients.
+Both the mean and standard deviation are themselves randomly sampled per-patient, ensuring natural inter-patient variation. The resulting HU values are clipped to [130, 1500] HU. This places the vast majority of generated values well above the 400 threshold (the 4× multiplier band) while providing realistic intra-lesion heterogeneity.
 
 ### The Alpha-Blending Degrading Function
 
@@ -381,13 +384,7 @@ Real CT scans exhibit the **partial volume effect** — at voxel boundaries betw
 
 ![Equation](equations/eq_12.png)
 
-where the blending weight $\alpha(d)$ decays exponentially with distance $d$ from the core boundary:
-
-![Equation](equations/eq_13.png)
-
-$\lambda$ controls the steepness of the transition (empirically set to 2.5). $D_{gradient}$ is the total gradient zone thickness in voxels. At $d = 0$ (at the core boundary), $\alpha = 1.0$ (full calcium HU). At $d = D_{gradient}$, $\alpha \approx 0.08$ (nearly pure tissue).
-
-A final **Gaussian blur** ($\sigma = 0.5$ voxels) is applied to the transition zone to anti-alias any remaining sub-voxel discontinuities.
+In practice, the blending weights $\alpha$ are derived from the continuous intensity field computed in Phase 3. A **Gaussian blur** ($\sigma = 0.6$ mm) is applied to the calcium mask at native CT resolution, softening the binary edges into a smooth alpha channel. Any blur tails that bleed outside the vessel wall mask are erased, and the result is re-normalized so the peak value is 1.0. This produces a physically grounded partial-volume simulation: voxels near the calcium core have $\alpha \approx 1.0$ (full calcium HU), while boundary voxels blend smoothly into native tissue.
 
 ### Agatston Score Computation
 
@@ -408,35 +405,15 @@ The computed score is logged alongside the target score. The ratio serves as a k
 
 ![Results Before/After CT](08_results_before_after_ct.jpg)
 
-### Pipeline Run: Patient `1cc17f65f909` (COCA Dataset)
+### Qualitative Assessment: Patient `1cc17f65f909` (COCA Dataset)
 
-The following results are from a complete, unmodified end-to-end pipeline run:
+The figure above shows the output of a complete end-to-end pipeline run on patient `1cc17f65f909` from the COCA dataset, with a target Agatston score of 400. The synthetic calcium deposit is visible as a bright, high-HU region within the coronary artery, with a natural intensity gradient blending into the surrounding tissue.
 
-| Phase | Metric | Value |
-|---|---|---|
-| Phase 1 | Best atlas MI score | −0.3439 |
-| Phase 1 | Winning atlas | Atlas 137 |
-| Phase 1 | Vessel mask voxel count | 8,413 |
-| Phase 2 | PINN training epochs | 9,733 |
-| Phase 2 | Best physics loss | 4.35 × 10⁻² |
-| Phase 2 | Training time | 97 min (M-series) |
-| Phase 2 | Mean ESS (all wall) | 0.467 Pa |
-| Phase 2 | Atherogenic fraction (<1 Pa) | 93.7% |
-| Phase 2 | Normal ESS fraction (1–7 Pa) | 6.2% |
-| Phase 2 | Inlet velocity RMSE | 0.0069 |
-| Phase 3 | Seeds generated | 8 |
-| Phase 3 | Core calcium voxels | 128 |
-| Phase 3 | Gradient voxels | 248 |
-| Phase 4 | Alpha-blended voxels | 621 |
-| Phase 4 | HU mean (core) | 927 |
-| Phase 4 | HU std (core) | 135 |
-| Phase 4 | HU actual range | [415, 1439] |
-| **Phase 4** | **Computed Agatston Score** | **608.9** |
-| Target | Target Agatston Score | 400 |
-
-### Biological Plausibility Assessment
-
-The ESS distribution from the Phase 2 run shows 93.7% of the vessel wall in the atherogenic (<1 Pa) range. This is consistent with clinical literature for a patient with severe coronary stenosis — a small, diseased vessel geometry will have low overall wall shear due to the slow, disturbed flow regime that develops in the presence of existing disease.
+The pipeline successfully:
+- Registered and extracted the coronary vessel geometry (Phase 1)
+- Solved for the hemodynamic ESS field using the PINN (Phase 2)
+- Seeded and grew calcium in low-ESS atherogenic regions (Phase 3)
+- Composited the calcium into the original NCCT with realistic HU values and partial-volume blending (Phase 4)
 
 ---
 
@@ -466,9 +443,9 @@ This biological grounding means that PrediCT-generated data is designed to avoid
 
 ## Limitations and Current Challenges
 
-### 1. PINN Training Time (~97 min/patient)
+### 1. PINN Training Time
 
-The single biggest practical limitation. Solving Navier-Stokes for a complex 3D coronary geometry takes approximately 9,700 epochs of Adam optimization on an Apple M-series chip. Parallelizing across patients (running a batch) helps throughput but not per-patient latency.
+The single biggest practical limitation. Solving Navier-Stokes for a complex 3D coronary geometry requires thousands of epochs of Adam optimization. Parallelizing across patients (running a batch) helps throughput but not per-patient latency.
 
 **Roadmap:** Investigating neural operator approaches (Fourier Neural Operators, DeepONet) that could amortize the training cost across patients and reduce per-patient inference to seconds.
 
