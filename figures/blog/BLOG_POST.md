@@ -1,14 +1,14 @@
-# PrediCT(Data Augmentation): A Physics-Informed Digital Twin for Synthetic Coronary Artery Calcium Generation
+# PrediCT(Data Augmentation): A Physics-Guided Digital Twin for Synthetic Coronary Artery Calcium Generation
 
-### Growing biologically realistic calcified plaque — inside a real patient's CT scan — using multi-atlas registration, Navier-Stokes PINNs, stochastic differential equations, and radiometric alpha-blending.
+### Growing biologically realistic calcified plaque — inside a real patient's CT scan — using multi-atlas registration, Navier-Stokes PINNs, stochastic growth models, and radiometric alpha-blending.
 
 ---
 
-Coronary Artery Disease (CAD) is the world's leading cause of death. One of the most powerful non-invasive tools for detecting it early is the **Coronary Artery Calcium (CAC) score** — a clinical metric derived from Non-Contrast CT (NCCT) scans that quantifies the total burden of calcified atherosclerotic plaque inside the coronary arteries. Studies have consistently shown that a high CAC score is one of the strongest independent predictors of future cardiac events (MESA trial, 2003–present).
+Cardiovascular disease is the world's leading cause of death, with Coronary Artery Disease (CAD) being a primary contributor. One of the most powerful non-invasive tools for detecting it early is the **Coronary Artery Calcium (CAC) score** — a clinical metric derived from Non-Contrast CT (NCCT) scans that quantifies the total burden of calcified atherosclerotic plaque inside the coronary arteries. Studies have consistently shown that a high CAC score is one of the strongest independent predictors of future cardiac events (MESA trial, 2002).
 
 Yet despite its clinical importance, training deep learning models to automatically detect, quantify, and predict CAC progression faces a fundamental data problem: **the vast majority of patients in population datasets are healthy.** In the publicly available COCA dataset (Coronary Calcium and Chest CTs), the distribution of Agatston scores is extremely right-skewed — most patients have a score of zero, and severe calcification (Agatston > 400) is rare. This class imbalance makes it nearly impossible to train robust models that generalize to the high-score patients who matter most clinically.
 
-The standard answer to data scarcity is synthetic data generation. But every existing approach shares the same fundamental weakness: **they learn to imitate the visual appearance of disease, not the biology that causes it.** A GAN trained on calcium CT images can produce a blob that looks vaguely like calcium in approximately the right location. But it has no concept of why calcium grows where it does — it has never heard of endothelial shear stress, never solved the Navier-Stokes equations, and has no model of the mechanobiology of atherosclerosis.
+The standard answer to data scarcity is synthetic data generation. But every existing approach shares the same fundamental weakness: **they learn to imitate the visual appearance of disease, not the biology that causes it.** A GAN trained on calcium CT images can produce a blob that looks vaguely like calcium in approximately the right location. But it lacks a physiological concept of why calcium grows where it does. While our approach still relies on empirical calibration to hit specific targets, it is fundamentally guided by endothelial shear stress, the Navier-Stokes equations, and the mechanobiology of atherosclerosis.
 
 **PrediCT takes a radically different approach.** Instead of learning to generate disease, we simulate the biophysical process that *causes* disease. We grow calcium the same way the human body does — driven by disturbed blood flow, mechanobiological vulnerability, and stochastic nucleation — and then composite it into a real patient's CT scan with full radiometric fidelity.
 
@@ -118,11 +118,11 @@ Traditional Computational Fluid Dynamics (CFD) on patient-specific coronary geom
 2. **Solving** a finite-element or finite-volume discretization of Navier-Stokes (minutes to hours depending on mesh resolution).
 3. **Post-processing** the resulting velocity field for wall shear stress.
 
-This is completely intractable at scale — you cannot run traditional CFD on hundreds of patients in a reasonable timeframe. Physics-Informed Neural Networks offer a fundamentally different paradigm.
+This is completely intractable at scale — you cannot run traditional CFD on hundreds of patients in a reasonable timeframe. Physics-Guided Neural Networks offer a fundamentally different paradigm.
 
 ### The PINN Architecture
 
-The hemodynamic surrogate is a **fully-connected Physics-Informed Neural Network (PINN)** that learns the mapping from spatial coordinates to flow variables directly, without ever being given labelled training data.
+The hemodynamic surrogate is a **fully-connected Physics-Guided Neural Network (PINN)** that learns the mapping from spatial coordinates to flow variables directly, without ever being given labelled training data.
 
 ![PINN Architecture](03_phase2_pinn_architecture.jpg)
 
@@ -194,7 +194,7 @@ The wall count was increased from 2,000 to 5,000 and interior from 3,000 to 8,00
 
 Training uses the **Adam optimizer** with an initial learning rate of $1 \times 10^{-3}$. A cosine annealing scheduler reduces the learning rate over the training cycle. **Early stopping** is triggered if the best validation loss does not improve over 5,000 consecutive epochs, preventing unnecessary computation.
 
-A typical training run converges in approximately 9,700–10,000 epochs (~90 minutes on Apple M-series silicon). The best-loss checkpoint is automatically restored before ESS computation.
+A typical training run converges in approximately 9,700–10,000 epochs (~97 minutes on Apple M-series silicon). The best-loss checkpoint is automatically restored before ESS computation.
 
 ### Computing Endothelial Shear Stress
 
@@ -270,13 +270,15 @@ Phase 2 has three hard physiological safety gates before ESS export:
 
 The ESS floor gate is the most critical. An ESS < 0.1 Pa indicates that the velocity field has collapsed to near-zero or that the geometry was degenerate, and any calcium grown from such a field would be physically meaningless. **If this gate fails, the entire run is aborted and the patient is flagged for manual review.**
 
+**Important Limitation (Mass Conservation):** The current PINN formulation achieves a mass conservation error of ~22.6% on this geometry. Because ESS is derived from the velocity gradient, this integral mass loss means the computed ESS field is a heuristic approximation of the true hemodynamics rather than a strictly conserved flow field. This limitation must be weighed when interpreting the exact ESS magnitudes.
+
 **Phase 2 Output:** `ess_predictions.csv` — a point cloud containing 3D physical coordinates, velocity vectors, and ESS magnitudes in Pascals for all validated wall points.
 
 ---
 
 ## Phase 3 — Stochastic Plaque Growth: Seeding Biology on the Hemodynamic Risk Map
 
-![SDE Plaque Growth](05b_phase3_sde_flowchart.jpg)
+![Stochastic Plaque Growth](05b_phase3_sde_flowchart.jpg)
 
 ### From ESS Field to 3D Voxel Mask
 
@@ -335,7 +337,9 @@ The final calcium mask is intersected with the vessel wall mask from Phase 1:
 final_mask = grown_mask & vessel_wall_mask
 ```
 
-This single line is the biological hard constraint that makes PrediCT physically sound. It is **mathematically impossible** for synthetic calcium to exist outside the anatomical boundaries of the coronary artery.
+This single line is the biological hard constraint that makes PrediCT physically sound. It is **guaranteed by construction** that synthetic calcium will not exist outside the anatomical boundaries of the coronary artery.
+
+**Note on Empirical Tuning:** While the plaque placement is guided by physical ESS boundaries, the seed counts (`N_seeds`) and maximum growth depths are empirically tuned to roughly target a desired Agatston score. This is a deliberate design choice to ensure clinical utility, acknowledging that biological simulation alone cannot deterministically predict exact clinical score thresholds without these tuning knobs.
 
 **Phase 3 Output:** `{patient_id}_synthetic_calcium_mask.nii.gz` — a multi-label NIfTI with label 1 (core) and label 2 (gradient) voxels.
 
@@ -396,13 +400,13 @@ After compositing, the pipeline runs a closed-loop **Agatston score computation*
 3. For each cluster with area ≥ 1 mm²: multiply voxel count by the appropriate density multiplier (1–4).
 4. Sum all weighted voxel contributions.
 
-The computed score is logged alongside the target score. The ratio serves as a key quality metric — a ratio > 1.5× from target flags the patient for seed parameter re-tuning.
+The computed score is logged alongside the target score. The ratio serves as a key quality metric — a ratio > 1.6× from target flags the patient for seed parameter re-tuning.
 
 **Phase 4 Output:** `{patient_id}_synthetic_coca.nii.gz` — the final, radiometrically faithful synthetic NCCT scan, clinically scoreable with standard Agatston software.
 
 ---
 
-## End-to-End Validation Results
+## Example Pipeline Run
 
 ![Results Before/After CT](08_results_before_after_ct.jpg)
 
@@ -461,13 +465,13 @@ A GAN-generated calcium blob will fool a radiologist visually. But it will fail 
 - Has a radiometrically calibrated HU profile with correct partial-volume blending
 - Has a computable Agatston score that can be directly compared to clinical targets
 
-This biological grounding means that PrediCT-generated data will not introduce distributional shortcuts that cause ML models to learn the wrong features.
+This biological grounding means that PrediCT-generated data is designed to avoid introducing distributional shortcuts that cause ML models to learn the wrong features.
 
 ---
 
 ## Limitations and Current Challenges
 
-### 1. PINN Training Time (~90 min/patient)
+### 1. PINN Training Time (~97 min/patient)
 
 The single biggest practical limitation. Solving Navier-Stokes for a complex 3D coronary geometry takes approximately 9,700 epochs of Adam optimization on an Apple M-series chip. Parallelizing across patients (running a batch) helps throughput but not per-patient latency.
 
@@ -500,12 +504,12 @@ PrediCT demonstrates that generating biologically realistic synthetic medical im
 By simulating the mechanobiological process that causes coronary atherosclerosis — disturbed hemodynamics driving endothelial dysfunction, driving plaque nucleation and growth — we produce synthetic calcium deposits that are:
 
 - **Anatomically constrained** (inside real patient vessels)
-- **Hemodynamically motivated** (placed where physics dictates)
+- **Hemodynamically guided** (placed where physics dictates)
 - **Morphologically realistic** (organic, asymmetric, nodular)
 - **Radiometrically faithful** (calibrated HU distributions, partial-volume blending)
 - **Clinically scoreable** (valid Agatston score computation)
 
-The four-phase pipeline — multi-atlas registration, PINN hemodynamics, stochastic SDE growth, and alpha-blended radiometric texturing — forms a complete, automated, and scientifically rigorous data synthesis system for cardiovascular AI.
+The four-phase pipeline — multi-atlas registration, PINN hemodynamics, stochastic plaque growth, and alpha-blended radiometric texturing — forms a complete, automated, and scientifically rigorous data synthesis system for cardiovascular AI.
 
 The code is fully open-source and available at [**github.com/CodeShrek/Predi_CT**](https://github.com/CodeShrek/Predi_CT).
 
