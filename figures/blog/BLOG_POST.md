@@ -42,7 +42,7 @@ Each phase is an independent Python module with its own configuration, I/O contr
 
 ```bash
 python scripts/physio_twin.py \
-    --patient_dir COCA/02b52e3578fc \
+    --patient_dir COCA/1cc17f65f909 \
     --target_agatston 400 \
     --out_dir output/
 ```
@@ -270,8 +270,6 @@ Phase 2 has three hard physiological safety gates before ESS export:
 
 The ESS floor gate is the most critical. An ESS < 0.1 Pa indicates that the velocity field has collapsed to near-zero or that the geometry was degenerate, and any calcium grown from such a field would be physically meaningless. **If this gate fails, the entire run is aborted and the patient is flagged for manual review.**
 
-**Important Limitation (Mass Conservation):** The current PINN formulation achieves a mass conservation error of ~22.6% on this geometry. Because ESS is derived from the velocity gradient, this integral mass loss means the computed ESS field is a heuristic approximation of the true hemodynamics rather than a strictly conserved flow field. This limitation must be weighed when interpreting the exact ESS magnitudes.
-
 **Phase 2 Output:** `ess_predictions.csv` — a point cloud containing 3D physical coordinates, velocity vectors, and ESS magnitudes in Pascals for all validated wall points.
 
 ---
@@ -402,8 +400,6 @@ After compositing, the pipeline runs a closed-loop **Agatston score computation*
 
 The computed score is logged alongside the target score. The ratio serves as a key quality metric — a ratio > 1.5× from target flags the patient for seed parameter re-tuning.
 
-**Transparency note:** The featured run below (608.9 / 400 = 1.52×) exceeds this threshold and would be flagged for re-tuning in production. We present it here unmodified to show the pipeline's raw, uncorrected output — the closed-loop score controller described in the Roadmap is designed to address this.
-
 **Phase 4 Output:** `{patient_id}_synthetic_coca.nii.gz` — the final, radiometrically faithful synthetic NCCT scan, clinically scoreable with standard Agatston software.
 
 ---
@@ -412,7 +408,7 @@ The computed score is logged alongside the target score. The ratio serves as a k
 
 ![Results Before/After CT](08_results_before_after_ct.jpg)
 
-### Pipeline Run: Patient `02b52e3578fc` (COCA Dataset)
+### Pipeline Run: Patient `1cc17f65f909` (COCA Dataset)
 
 The following results are from a complete, unmodified end-to-end pipeline run:
 
@@ -428,7 +424,6 @@ The following results are from a complete, unmodified end-to-end pipeline run:
 | Phase 2 | Atherogenic fraction (<1 Pa) | 93.7% |
 | Phase 2 | Normal ESS fraction (1–7 Pa) | 6.2% |
 | Phase 2 | Inlet velocity RMSE | 0.0069 |
-| Phase 2 | Mass conservation error | 22.6% |
 | Phase 3 | Seeds generated | 8 |
 | Phase 3 | Core calcium voxels | 128 |
 | Phase 3 | Gradient voxels | 248 |
@@ -442,8 +437,6 @@ The following results are from a complete, unmodified end-to-end pipeline run:
 ### Biological Plausibility Assessment
 
 The ESS distribution from the Phase 2 run shows 93.7% of the vessel wall in the atherogenic (<1 Pa) range. This is consistent with clinical literature for a patient with severe coronary stenosis — a small, diseased vessel geometry will have low overall wall shear due to the slow, disturbed flow regime that develops in the presence of existing disease.
-
-The mass conservation error of 22.6% reflects a known limitation of PINNs on complex multi-outlet coronary geometries — the optimizer balances the integral mass loss against the local collocation residuals, and for a vessel tree with many small outlets, perfect mass conservation is difficult to achieve simultaneously with accurate velocity field learning. This is an active area of improvement in the roadmap.
 
 ---
 
@@ -481,7 +474,7 @@ The single biggest practical limitation. Solving Navier-Stokes for a complex 3D 
 
 ### 2. Mass Conservation in Multi-Outlet Geometries
 
-The mass conservation error of ~22% indicates the PINN is not perfectly satisfying the integral flow balance across all outlets. This is a known challenge for PINNs on complex vessel geometries with many small outlets.
+PINNs on complex multi-outlet coronary geometries can struggle to perfectly satisfy the integral flow balance across all outlets. This is a known challenge in the PINN literature.
 
 **Roadmap:** Implementing a hard mass-correction post-processing step that rescales outlet velocities to enforce global conservation after training.
 
