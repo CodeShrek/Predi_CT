@@ -1,4 +1,4 @@
-# PrediCT(Data Augmentation): A Physics-Guided Digital Twin for Synthetic Coronary Artery Calcium Generation
+# PrediCT(Data Augmentation): A Physics-Informed Digital Twin for Synthetic Coronary Artery Calcium Generation
 
 ### Growing biologically realistic calcified plaque — inside a real patient's CT scan — using multi-atlas registration, Navier-Stokes PINNs, stochastic growth models, and radiometric alpha-blending.
 
@@ -118,11 +118,11 @@ Traditional Computational Fluid Dynamics (CFD) on patient-specific coronary geom
 2. **Solving** a finite-element or finite-volume discretization of Navier-Stokes (minutes to hours depending on mesh resolution).
 3. **Post-processing** the resulting velocity field for wall shear stress.
 
-This is completely intractable at scale — you cannot run traditional CFD on hundreds of patients in a reasonable timeframe. Physics-Guided Neural Networks offer a fundamentally different paradigm.
+This is completely intractable at scale — you cannot run traditional CFD on hundreds of patients in a reasonable timeframe. Physics-Informed Neural Networks offer a fundamentally different paradigm.
 
 ### The PINN Architecture
 
-The hemodynamic surrogate is a **fully-connected Physics-Guided Neural Network (PINN)** that learns the mapping from spatial coordinates to flow variables directly, without ever being given labelled training data.
+The hemodynamic surrogate is a **fully-connected Physics-Informed Neural Network (PINN)** that learns the mapping from spatial coordinates to flow variables directly, without ever being given labelled training data.
 
 ![PINN Architecture](03_phase2_pinn_architecture.jpg)
 
@@ -400,7 +400,9 @@ After compositing, the pipeline runs a closed-loop **Agatston score computation*
 3. For each cluster with area ≥ 1 mm²: multiply voxel count by the appropriate density multiplier (1–4).
 4. Sum all weighted voxel contributions.
 
-The computed score is logged alongside the target score. The ratio serves as a key quality metric — a ratio > 1.6× from target flags the patient for seed parameter re-tuning.
+The computed score is logged alongside the target score. The ratio serves as a key quality metric — a ratio > 1.5× from target flags the patient for seed parameter re-tuning.
+
+**Transparency note:** The featured run below (608.9 / 400 = 1.52×) exceeds this threshold and would be flagged for re-tuning in production. We present it here unmodified to show the pipeline's raw, uncorrected output — the closed-loop score controller described in the Roadmap is designed to address this.
 
 **Phase 4 Output:** `{patient_id}_synthetic_coca.nii.gz` — the final, radiometrically faithful synthetic NCCT scan, clinically scoreable with standard Agatston software.
 
