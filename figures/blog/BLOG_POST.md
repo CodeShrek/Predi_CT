@@ -92,14 +92,15 @@ The atlas with the **most negative MI score** (highest information overlap) is s
 
 > **Key Design Decision:** An earlier version used **Majority Vote Fusion** — averaging all N registered atlases together. This produced smoother, more rounded vessel masks with fewer registration artifacts. But testing revealed a critical failure: fusion blurred out sharp vessel bifurcations and inner curvatures — exactly the geometric features that drive turbulent flow and calcium formation in Phase 2. Switching to single-winner Best-Atlas Voting preserved these features at the cost of slightly higher registration variance on poor-quality scans. The biological accuracy trade-off was worth it.
 
-### Validation Gate 1: Phase 1 Plaque Consistency Check
+### Phase 1 Registration Diagnostics
 
-After generating the vessel mask, a hard validation gate checks whether the proposed synthetic calcium location (from Phase 3, precomputed as a seed) is physically consistent with the actual vessel anatomy. The `PlaqueValidator` class confirms that:
+After generating the best-atlas vessel mask, the pipeline runs the `PlaqueValidator` suite to evaluate the registration quality. Because ground-truth vessel masks do not exist for the COCA dataset, we use proxy metrics to ensure anatomical validity before physics simulation:
 
-1. The vessel mask is non-empty and contains a connected component of sufficient voxel volume.
-2. The mask is loaded at native resolution to avoid resampling artifacts that could bias Phase 2 geometry.
+1. **Ensemble Consensus:** Computes the mean pairwise centerline distance between the top registered atlases. A low distance (< 5.0mm) indicates that multiple independent atlases agreed on the vessel geometry.
+2. **Ostial Anchoring:** Checks the deviation of the mask's center of mass from the expected location of the aortic root.
+3. **Ground Truth Calcium Overlap:** Loads the patient's actual COCA calcium segmentation at native resolution and checks what percentage of it falls near our generated vessel wall.
 
-If these checks fail, Phase 1 raises a `RuntimeError` and aborts the run, preventing bad anatomy from propagating into the fluid simulation.
+These metrics are logged as diagnostic warnings to help flag patients whose NCCT scans are too low-quality or anomalous for successful registration, without hard-aborting the pipeline prematurely.
 
 **Phase 1 Output:** `{patient_id}_synthetic_vessel.nii.gz` — a binary 3D NIfTI image delineating the coronary artery tree in patient space.
 
@@ -139,17 +140,17 @@ Training a single network on variables spanning six orders of magnitude is numer
 
 | Physical Quantity | Scale | Reference Value |
 |---|---|---|
-| Length $L_0$ | Mean vessel length | ~10 mm |
-| Velocity $U_0$ | Mean inlet velocity | ~0.3 m/s |
-| Time $T_0$ | $L_0 / U_0$ | ~0.033 s |
-| Pressure $P_0$ | $\rho U_0^2$ | ~90 Pa |
-| Reynolds Number $Re$ | $\rho U_0 L_0 / \mu$ | ~150 (laminar) |
+| Length $L_0$ | Mean vessel diameter | 3.0 mm |
+| Velocity $U_0$ | Mean inlet velocity | 0.25 m/s |
+| Time $T_0$ | $L_0 / U_0$ | 0.012 s |
+| Pressure $P_0$ | $\rho U_0^2$ | 66.25 Pa |
+| Reynolds Number $Re$ | $\rho U_0 L_0 / \mu$ | ~227 (laminar) |
 
 The dimensionless coordinates are $x^* = x/L_0$ and the dimensionless velocities are $u^* = u/U_0$. The PINN operates entirely in this dimensionless space.
 
 ### The Physics Loss Function
 
-The training loss is a weighted sum of four residual terms, each enforcing a different physical constraint:
+The training loss is a weighted sum of six residual terms, each enforcing a different physical constraint:
 
 #### 1. Continuity (Mass Conservation)
 For incompressible Newtonian flow:
@@ -172,10 +173,17 @@ where $R^*$ is the **patient-specific inlet radius** measured from the vessel ce
 At vessel outlets, we enforce a zero-gradient (fully-developed flow) condition:
 ![Equation](equations/eq_07.png)
 
+#### 6. Integral Mass Conservation
+A global constraint enforcing that total volumetric flux entering the domain equals total flux leaving. The loss is the squared difference between inlet and outlet flow rates, estimated via Monte Carlo surface integration:
+
+```
+L_integral_mass = (Q_in − Q_out)²    where Q = A · mean(V · n)
+```
+
 The **total weighted loss** is:
 ![Equation](equations/eq_08.png)
 
-The $\lambda$ weights are tuned per-term: $\lambda_{continuity} = 10$, $\lambda_{momentum} = 1$, $\lambda_{wall} = 10$, $\lambda_{inlet} = 500$ (high to prevent trivial solution collapse), $\lambda_{outlet} = 1$, and $\lambda_{integral\_mass} = 50$.
+The $\lambda$ weights are tuned per-term: $\lambda_{continuity} = 10$, $\lambda_{momentum} = 1$, $\lambda_{wall} = 10$, $\lambda_{inlet} = 500$ (high to prevent trivial solution collapse), $\lambda_{outlet} = 1$, and $\lambda_{integral\_mass} = 50$ (enforces global flow conservation).
 
 ### Collocation Point Sampling
 
@@ -188,7 +196,7 @@ The network is trained not on a fixed mesh, but on randomly sampled **collocatio
 | **Inlet** | 500 pts | Circular disk at aortic ostium |
 | **Outlet** | 500 pts/outlet | Circular disk at each branch termination |
 
-During development, the collocation counts were tuned upward from initial lower values after discovering that ESS computation was undersampling the boundary layer — the thin region near the wall where velocity gradients are steepest.
+During development, these counts were calibrated to balance accuracy against memory constraints. Increasing wall points beyond 2,000 improved boundary-layer resolution for ESS but at diminishing returns for the additional GPU memory cost.
 
 ### Optimization
 
@@ -231,7 +239,7 @@ The fix reduced all ESS values by exactly a factor of $U_0/L_0 \approx 83\ \text
 
 The PINN repeatedly discovered that predicting $\mathbf{u}^* = 0$ everywhere was a perfectly valid solution to the continuity and momentum equations (trivially satisfied by zero velocity and zero pressure gradient). This "trivial solution" produces zero physics loss but zero useful hemodynamics.
 
-**Fix 1 — Inlet Dirichlet Enforcement:** Strongly enforcing the parabolic inlet profile with $\lambda_{inlet} = 1.0$ prevents the zero-velocity collapse at the inlet boundary, forcing the network to propagate non-zero flow into the domain.
+**Fix 1 — Inlet Dirichlet Enforcement:** Strongly enforcing the parabolic inlet profile with $\lambda_{inlet} = 500$ prevents the zero-velocity collapse at the inlet boundary, forcing the network to propagate non-zero flow into the domain.
 
 **Fix 2 — Velocity Collapse Detection Gate:** After training, the pipeline evaluates the mean velocity magnitude across the interior. If $|\mathbf{u}^*|_{mean} < 1 \times 10^{-2}$, a `RuntimeError` is raised:
 ```
@@ -257,18 +265,19 @@ The artificial cut-plane at each vessel outlet terminus produces a geometric edg
 
 ### Validation Gates — Phase 2
 
-Phase 2 has three hard physiological safety gates before ESS export:
+Phase 2 has two hard abort gates and two diagnostic logging checks before ESS export:
 
 | Gate | Check | Threshold | Failure Action |
 |---|---|---|---|
 | **Velocity Collapse** | $|\mathbf{u}^*|_{mean}$ | $> 1 \times 10^{-2}$ | Abort pipeline |
-| **Inlet Profile RMSE** | $RMSE(u_{pred}, u_{HP})$ | $< 0.05$ | Warning + continue |
-| **ESS Physiological Floor** | $\overline{ESS}_{wall}$ | $> 0.1$ Pa | Abort pipeline |
-| **Mass Conservation Error** | $|Q_{in} - Q_{out}| / Q_{in}$ | Logged | Warning only |
+| **ESS Floor** | $\overline{ESS}_{wall}$ | $> 0.1$ Pa | Abort pipeline |
+| **ESS Ceiling** | $\overline{ESS}_{wall}$ | $< 10.0$ Pa | Abort pipeline |
+| **Inlet Profile RMSE** | $RMSE(u_{pred}, u_{HP})$ | Logged | Diagnostic only |
+| **Mass Conservation Error** | $|Q_{in} - Q_{out}| / Q_{in}$ | Logged | Diagnostic only |
 
 ![Phase 2 ESS Heatmap](04_phase2_ess_heatmap.png)
 
-The ESS floor gate is the most critical. An ESS < 0.1 Pa indicates that the velocity field has collapsed to near-zero or that the geometry was degenerate, and any calcium grown from such a field would be physically meaningless. **If this gate fails, the entire run is aborted and the patient is flagged for manual review.**
+The ESS physiological range gate is the most critical. An ESS < 0.1 Pa indicates velocity field collapse or degenerate geometry. An ESS > 10.0 Pa indicates numerical divergence or incorrect scaling. In either case, the run is aborted and the patient flagged for manual review. The inlet RMSE and mass conservation error are logged as diagnostics but do not abort the pipeline.
 
 **Phase 2 Output:** `ess_predictions.csv` — a point cloud containing 3D physical coordinates, velocity vectors, and ESS magnitudes in Pascals for all validated wall points.
 
@@ -284,7 +293,7 @@ Phase 2 produces an ESS point cloud in physical coordinates. Phase 3 must transl
 
 #### Step 1: ESS Interpolation to Dense Grid
 
-The ESS point cloud is first interpolated onto the full voxel grid of the vessel mask using `scipy.interpolate.griddata` with a linear interpolation scheme. Only voxels inside the vessel mask are interpolated (saving substantial computation). Voxels outside the vessel receive a neutral ESS of 1.5 Pa (normal range, zero growth probability).
+The ESS point cloud is first interpolated onto the full voxel grid of the vessel mask using `scipy.interpolate.griddata` with a **nearest-neighbour** interpolation scheme. Only voxels inside the vessel mask are interpolated (saving substantial computation). Voxels outside the vessel mask receive an ESS of 0.0 (excluded from growth probability).
 
 ```
 Dense ESS Field Shape: (Z, Y, X) ← native CT resolution, typically 1×1×1 mm voxels
@@ -370,7 +379,7 @@ The Agatston scoring algorithm uses HU thresholds to assign density multipliers 
 | 300–399 | 3 |
 | ≥ 400 | 4 |
 
-For maximum score density, we want the majority of core calcium voxels in the ≥400 HU band. To match the natural variance seen in clinical data, the HU profile for each synthetic scan is dynamically sampled from a Gaussian distribution. For example, a typical generation might use:
+For maximum score density, we want the majority of high-intensity calcium voxels in the ≥400 HU band. To match the natural variance seen in clinical data, the HU profile for each synthetic scan is dynamically sampled from a Gaussian distribution. For example, a typical generation might use:
 
 $$\mu_{HU} \sim \mathcal{N}(850,\ 100), \quad \sigma_{HU} \sim \mathcal{N}(150,\ 30)$$
 
@@ -384,7 +393,7 @@ Real CT scans exhibit the **partial volume effect** — at voxel boundaries betw
 
 ![Equation](equations/eq_12.png)
 
-In practice, the blending weights $\alpha$ are derived from the continuous intensity field computed in Phase 3. A **Gaussian blur** ($\sigma = 0.6$ mm) is applied to the calcium mask at native CT resolution, softening the binary edges into a smooth alpha channel. Any blur tails that bleed outside the vessel wall mask are erased, and the result is re-normalized so the peak value is 1.0. This produces a physically grounded partial-volume simulation: voxels near the calcium core have $\alpha \approx 1.0$ (full calcium HU), while boundary voxels blend smoothly into native tissue.
+In practice, the blending weights $\alpha$ are derived from the continuous intensity field computed in Phase 3. A **Gaussian blur** ($\sigma = 0.6$ mm) is applied to the calcium mask at native CT resolution, softening the binary edges into a smooth alpha channel. Any blur tails that bleed outside the vessel wall mask are erased, and the result is re-normalized so the peak value is 1.0. This produces a physically grounded partial-volume simulation: voxels near the high-intensity region have $\alpha \approx 1.0$ (full calcium HU), while boundary voxels blend smoothly into native tissue.
 
 ### Agatston Score Computation
 
@@ -392,8 +401,8 @@ After compositing, the pipeline runs a closed-loop **Agatston score computation*
 
 1. Threshold the scan at 130 HU to identify all candidate calcium voxels.
 2. Apply connected-component labelling to separate distinct calcium clusters.
-3. For each cluster with area ≥ 1 mm²: multiply voxel count by the appropriate density multiplier (1–4).
-4. Sum all weighted voxel contributions.
+3. For each cluster with area ≥ 1 mm²: compute the cross-sectional area and multiply by the appropriate density multiplier (1–4) and slice thickness normalization factor.
+4. Sum all weighted area contributions across all axial slices.
 
 The computed score is logged alongside the target score. The ratio serves as a key quality metric — a ratio > 1.5× from target flags the patient for seed parameter re-tuning.
 
