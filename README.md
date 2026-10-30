@@ -104,13 +104,4 @@ python scripts/nifti_to_dicom.py \
 
 ---
 
-## References
 
-1. **Chatzizisis, Y. S., et al. (2007)**. *Role of Endothelial Shear Stress in the Natural History of Coronary Atherosclerosis*. JACC, 49(25), 2379–2393.
-2. **Raissi, M., Perdikaris, P., & Karniadakis, G. E. (2019)**. *Physics-Informed Neural Networks*. Journal of Computational Physics, 378, 686–707.
-3. **Gao, J., et al. (2023)**. *Coronary Calcium and Chest CTs (COCA) Dataset*. PhysioNet.
-
----
-
-## License
-Distributed under the [MIT License](LICENSE).
