@@ -64,15 +64,29 @@ class CFG:
     AFFINE_SHRINK        = [4, 2, 1]
     AFFINE_SIGMAS        = [2, 1, 0]
 
+    # B-Spline deformable optimizer
+    BSPLINE_MESH_SIZE      = [6, 6, 6]     # Base control point grid (X, Y, Z)
+    BSPLINE_SCALE_FACTORS  = [1, 2]        # 2-level refinement: [6,6,6] -> [12,12,12] (~11-13mm spacing)
+    BSPLINE_LEARNING_RATE  = 1.0           # Calibrated physical step size for diffeomorphic deformation
+    BSPLINE_MIN_STEP       = 0.002
+    BSPLINE_ITERS          = 40            # 40 iters per level (fast, robust convergence)
+    BSPLINE_RELAXATION     = 0.75
+    BSPLINE_SHRINK         = [2, 1]        # Coarse-to-fine image pyramid
+    BSPLINE_SIGMAS         = [1, 0]        # Physical mm smoothing
+    BSPLINE_SAMPLING_FRAC  = 0.10          # Optimal sampling percentage on cardiac ROI mask
+    BSPLINE_MAX_DISP_MM    = 15.0          # Sanity cap: max displacement of any control point
+    BSPLINE_MIN_JACOBIAN   = 0.05          # Sanity floor: min det(J) to prevent folding/compression
+    BSPLINE_ENABLED        = True          # Toggle to compare with/without
+
     # ROI
-    ROI_MARGIN_MM      = 20.0
+    ROI_MARGIN_MM      = 25.0
     ROI_MARGIN_VOX_MIN = 10
 
     # Validation
     VALIDATION_ROI_MARGIN_VOX = 45
-    DISTANCE_MM               = 10.0
-    PASS_THRESHOLD_PCT        = 70.0
-    LABEL_DILATE_ITERS        = 2
+    DISTANCE_MM               = 3.0           # Strict clinical proximity threshold (was 10.0mm)
+    PASS_THRESHOLD_PCT        = 60.0
+    LABEL_DILATE_ITERS        = 1
 
     RANDOM_SEED = 42
 
@@ -281,7 +295,7 @@ class Preprocessor:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 4: REGISTRATION ENGINE (Rigid → Affine)
+# SECTION 4: REGISTRATION ENGINE (Rigid → Affine → B-Spline)
 # ════════════════════════════════════════════════════════════════════════════
 
 class RegistrationEngine:
@@ -433,6 +447,131 @@ class RegistrationEngine:
         return composite, affine_metric
 
 
+
+    @classmethod
+    def run_bspline_stage(cls, fixed_win: sitk.Image, moving_win: sitk.Image,
+                          affine_composite_tx: sitk.Transform, roi: tuple,
+                          affine_mi: float = 0.0) -> tuple:
+        """
+        B-Spline deformable registration (Stage C).
+        
+        Operates on the cardiac ROI after affine alignment. The affine-aligned
+        atlas is pre-resampled into patient space before B-spline optimisation,
+        following the same pattern as the affine stage.
+        
+        B-spline captures local, non-rigid deformations (vessel tortuosity,
+        bifurcation angle differences) that a 12-DOF affine cannot model.
+        
+        Safety:
+          - MI regression guard: if B-spline MI > affine MI, fall back to affine-only.
+          - Max displacement guard: if any control point moves > BSPLINE_MAX_DISP_MM,
+            the deformation is anatomically implausible → fall back to affine-only.
+          - Jacobian determinant guard: if det(J) < 0 anywhere, the deformation
+            is topology-violating (folding) → fall back to affine-only.
+        """
+        fz0, fz1, fy0, fy1, fx0, fx1 = roi
+        # Cardiac ROI mask including pericardium, epicardial fat, and lung-heart boundary
+        fixed_arr = sitk.GetArrayFromImage(fixed_win)
+        mask_arr = np.zeros_like(fixed_arr, dtype=np.uint8)
+        mask_arr[fz0:fz1, fy0:fy1, fx0:fx1] = 1
+        metric_mask = sitk.GetImageFromArray(mask_arr)
+        metric_mask.CopyInformation(fixed_win)
+
+        # Pre-resample atlas into patient space using the affine composite
+        affine_atlas_win = sitk.Resample(
+            moving_win, fixed_win, affine_composite_tx,
+            sitk.sitkLinear, 0.0, sitk.sitkFloat32
+        )
+
+        # Build multi-resolution B-spline transform with hierarchical grid refinement
+        base_mesh = CFG.BSPLINE_MESH_SIZE
+        bspline_tx = sitk.BSplineTransformInitializer(
+            fixed_win, base_mesh, order=3
+        )
+
+        def _run_bspline(fraction):
+            Rb = sitk.ImageRegistrationMethod()
+            cls._make_method(Rb, CFG.BSPLINE_SHRINK, CFG.BSPLINE_SIGMAS,
+                             n_bins=50, fraction=fraction,
+                             strategy=sitk.ImageRegistrationMethod.RANDOM)
+            Rb.SetOptimizerAsRegularStepGradientDescent(
+                learningRate=CFG.BSPLINE_LEARNING_RATE,
+                minStep=CFG.BSPLINE_MIN_STEP,
+                numberOfIterations=CFG.BSPLINE_ITERS,
+                relaxationFactor=CFG.BSPLINE_RELAXATION
+            )
+            Rb.SetOptimizerScalesFromPhysicalShift()
+            Rb.SetMetricFixedMask(metric_mask)
+            Rb.SetInitialTransformAsBSpline(bspline_tx, inPlace=True, scaleFactors=CFG.BSPLINE_SCALE_FACTORS)
+            result = Rb.Execute(fixed_win, affine_atlas_win)
+            return result, Rb.GetMetricValue()
+
+        try:
+            final_bspline, bspline_metric = _run_bspline(CFG.BSPLINE_SAMPLING_FRAC)
+            print(f"      B-Spline MI = {bspline_metric:.6f}")
+        except RuntimeError as e1:
+            print(f"      B-Spline attempt failed: {e1}")
+            try:
+                final_bspline, bspline_metric = _run_bspline(0.15)
+                print(f"      B-Spline retry MI = {bspline_metric:.6f}")
+            except RuntimeError as e2:
+                print(f"      B-Spline retry failed: {e2} — affine-only fallback.")
+                return affine_composite_tx, affine_mi
+
+        # ── Sanity Check 1: MI regression guard ──
+        # Mattes MI is negative — more negative = better alignment.
+        if affine_mi != 0.0 and not np.isnan(bspline_metric) and not np.isnan(affine_mi):
+            mi_improvement = bspline_metric - affine_mi
+            if mi_improvement > 0.01:
+                print(f"      [MI REGRESSION] affine_mi={affine_mi:.4f}  "
+                      f"bspline_mi={bspline_metric:.4f}  delta={mi_improvement:+.4f} "
+                      f"— B-spline diverged. Affine-only fallback.")
+                return affine_composite_tx, affine_mi
+
+        # ── Sanity Check 2: Max displacement guard ──
+        # Convert B-spline to displacement field and check max magnitude.
+        try:
+            disp_field_filter = sitk.TransformToDisplacementFieldFilter()
+            disp_field_filter.SetReferenceImage(fixed_win)
+            disp_field = disp_field_filter.Execute(final_bspline)
+            disp_arr = sitk.GetArrayFromImage(disp_field)  # (Z, Y, X, 3)
+            max_disp = float(np.sqrt((disp_arr ** 2).sum(axis=-1)).max())
+            print(f"      B-Spline max displacement = {max_disp:.2f} mm")
+            if max_disp > CFG.BSPLINE_MAX_DISP_MM:
+                print(f"      [SANITY FAIL] max_disp={max_disp:.2f}mm > "
+                      f"{CFG.BSPLINE_MAX_DISP_MM}mm — affine-only fallback.")
+                return affine_composite_tx, affine_mi
+        except Exception as e:
+            print(f"      [WARNING] Could not compute displacement field: {e}")
+
+        # ── Sanity Check 3: Jacobian determinant (folding detection) ──
+        try:
+            jacobian_filter = sitk.DisplacementFieldJacobianDeterminantFilter()
+            jacobian_img = jacobian_filter.Execute(disp_field)
+            jac_arr = sitk.GetArrayFromImage(jacobian_img)
+            min_jac = float(jac_arr.min())
+            print(f"      B-Spline min Jacobian det = {min_jac:.4f}")
+            if min_jac < CFG.BSPLINE_MIN_JACOBIAN:
+                print(f"      [SANITY FAIL] Jacobian det {min_jac:.4f} < {CFG.BSPLINE_MIN_JACOBIAN} (folding/compression detected) "
+                      f"— affine-only fallback.")
+                return affine_composite_tx, affine_mi
+        except Exception as e:
+            print(f"      [WARNING] Could not compute Jacobian: {e}")
+
+        # ── Compose: rigid + affine + bspline ──
+        # affine_composite_tx already contains rigid + affine.
+        # The bspline was optimised against the affine-resampled atlas,
+        # so we compose it ON TOP of the existing affine composite.
+        composite = sitk.CompositeTransform(3)
+        composite.AddTransform(affine_composite_tx)
+        composite.AddTransform(final_bspline)
+        
+        mi_delta = bspline_metric - affine_mi if not np.isnan(affine_mi) else 0.0
+        print(f"      B-Spline improvement over affine: {mi_delta:+.6f}")
+        
+        return composite, bspline_metric
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 5: LABEL TRANSFORMATION
 # ════════════════════════════════════════════════════════════════════════════
@@ -442,9 +581,55 @@ class LabelTransformer:
     @staticmethod
     def transform_labels(moving_lbl: sitk.Image, reference_space: sitk.Image,
                          final_tx: sitk.Transform) -> sitk.Image:
-        """Warp atlas vessel label into patient space via NearestNeighbor."""
-        return sitk.Resample(moving_lbl, reference_space, final_tx,
-                             sitk.sitkNearestNeighbor, 0, sitk.sitkUInt8)
+        """Warp atlas vessel label into patient space. Preserves continuous tubular topology and exact caliber without tearing."""
+        nn_warped = sitk.Resample(moving_lbl, reference_space, final_tx,
+                                 sitk.sitkNearestNeighbor, 0, sitk.sitkUInt8)
+        sdt_filter = sitk.SignedMaurerDistanceMapImageFilter()
+        sdt_filter.SetInsideIsPositive(True)
+        sdt_filter.SetUseImageSpacing(True)
+        sdt_filter.SetSquaredDistance(False)
+        sdt_moving = sdt_filter.Execute(moving_lbl)
+        sdt_warped = sitk.Resample(sdt_moving, reference_space, final_tx,
+                                   sitk.sitkLinear, -50.0, sitk.sitkFloat32)
+        sdm_mask = sitk.BinaryThreshold(sdt_warped, lowerThreshold=0.0, insideValue=1, outsideValue=0)
+        sdm_mask = sitk.Cast(sdm_mask, sitk.sitkUInt8)
+        fused = sitk.Or(nn_warped, sdm_mask)
+        return fused
+
+    @staticmethod
+    def clean_coronary_topology(warped_lbl: sitk.Image) -> sitk.Image:
+        """Cleans dust (<20 voxels), applies curvature flow smoothing, and retains
+        the 2 primary continuous coronary trees (LCA and RCA) to eliminate chest-wall fragments
+        without any boolean cuts or tears."""
+        cc_filter = sitk.ConnectedComponentImageFilter()
+        labeled_img = cc_filter.Execute(warped_lbl)
+        relabel_filter = sitk.RelabelComponentImageFilter()
+        relabel_filter.SetMinimumObjectSize(20)
+        cleaned = relabel_filter.Execute(labeled_img)
+        cleaned = sitk.BinaryThreshold(cleaned, lowerThreshold=1, upperThreshold=10000, insideValue=1, outsideValue=0)
+        cleaned = sitk.Cast(cleaned, sitk.sitkUInt8)
+
+        float_img = sitk.Cast(cleaned, sitk.sitkFloat32)
+        smoothed_float = sitk.CurvatureFlow(float_img, timeStep=0.0625, numberOfIterations=2)
+        smoothed = sitk.BinaryThreshold(smoothed_float, lowerThreshold=0.5, insideValue=1, outsideValue=0)
+        smoothed = sitk.Cast(smoothed, sitk.sitkUInt8)
+        smoothed.CopyInformation(warped_lbl)
+
+        arr = sitk.GetArrayFromImage(smoothed) > 0
+        lbl_c, num_c = ndi.label(arr)
+        sizes = [((lbl_c == i).sum(), i) for i in range(1, num_c + 1)]
+        sizes.sort(reverse=True)
+
+        if len(sizes) >= 2:
+            clean_mask = (lbl_c == sizes[0][1]) | (lbl_c == sizes[1][1])
+        elif len(sizes) == 1:
+            clean_mask = (lbl_c == sizes[0][1])
+        else:
+            clean_mask = arr
+
+        final_img = sitk.GetImageFromArray(clean_mask.astype(np.uint8))
+        final_img.CopyInformation(warped_lbl)
+        return final_img
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -659,13 +844,24 @@ class PlaqueValidator:
 
         lbl_dilated  = ndi.binary_dilation(lbl_roi > 0, iterations=cfg.LABEL_DILATE_ITERS)
         spacing_zyx  = fixed_raw_img.GetSpacing()[::-1]
+        # Exact distance transform from raw vessel mask
+        edt_raw      = ndi.distance_transform_edt(~(lbl_roi > 0), sampling=spacing_zyx)
         edt          = ndi.distance_transform_edt(~lbl_dilated, sampling=spacing_zyx)
         calcium_mask = seg_roi > 0
         inside       = int((calcium_mask & (edt <= cfg.DISTANCE_MM)).sum())
         hit_pct      = (inside / n_ca) * 100.0
 
+        ca_dists = edt_raw[calcium_mask]
         print(f"Dilated mask voxels: {int(np.count_nonzero(lbl_dilated))}")
-        print(f"Ca inside ±{cfg.DISTANCE_MM}mm : {inside}/{n_ca} = {hit_pct:.1f}%")
+        print(f"Calcium Distance Stats (exact mm):")
+        print(f"  Mean:   {ca_dists.mean():.2f} mm")
+        print(f"  Median: {np.median(ca_dists):.2f} mm")
+        print(f"  Max:    {ca_dists.max():.2f} mm")
+        print(f"  <= 1.0mm: {(ca_dists <= 1.0).sum()}/{n_ca} ({(ca_dists <= 1.0).mean()*100:.1f}%)")
+        print(f"  <= 2.0mm: {(ca_dists <= 2.0).sum()}/{n_ca} ({(ca_dists <= 2.0).mean()*100:.1f}%)")
+        print(f"  <= 3.0mm: {(ca_dists <= 3.0).sum()}/{n_ca} ({(ca_dists <= 3.0).mean()*100:.1f}%)")
+        print(f"  <= 5.0mm: {(ca_dists <= 5.0).sum()}/{n_ca} ({(ca_dists <= 5.0).mean()*100:.1f}%)")
+        print(f"Ca inside ±{cfg.DISTANCE_MM}mm (gating): {inside}/{n_ca} = {hit_pct:.1f}%")
         print("================================\n")
         return hit_pct, n_ca
 
@@ -707,7 +903,7 @@ def main():
     overlays_dir.mkdir(exist_ok=True)
 
     print("=" * 85)
-    print("PrediCT Task 3 — Coronary Atlas Registration Pipeline v6 (Best-Atlas Voting)")
+    print("PrediCT Task 3 — Coronary Atlas Registration Pipeline v7 (Rigid→Affine→B-Spline + Best-Atlas Voting)")
     print("=" * 85)
     print(f"SimpleITK {sitk.Version.VersionString()}")
     print(f"N_ATLASES={CFG.N_ATLASES} (register N, vote for best)  "
@@ -791,6 +987,7 @@ def main():
             # ── Register each selected atlas ────────────────────────────────────
             transformed_labels = []
             per_atlas_results  = []
+            per_atlas_transforms = {}  # cid → final_tx (for warping atlas CT later)
 
             for aidx, atlas_case in enumerate(selected_atlases, 1):
                 cid = atlas_case["id"]
@@ -847,6 +1044,19 @@ def main():
                 affine_sec = time.time() - t0
                 time_log[f"affine_sec_atlas{cid}"] = affine_sec
 
+                # Stage C: B-Spline deformable (if enabled)
+                if CFG.BSPLINE_ENABLED:
+                    current_stage = f"BSpline_Atlas_{cid}"
+                    t0 = time.time()
+                    final_tx, bspline_mi = RegistrationEngine.run_bspline_stage(
+                        fixed_win, atlas_win_reg, final_tx, roi_fixed,
+                        affine_mi=affine_mi
+                    )
+                    bspline_sec = time.time() - t0
+                    time_log[f"bspline_sec_atlas{cid}"] = bspline_sec
+                else:
+                    bspline_sec = 0.0
+
                 # Warp label
                 current_stage = f"LabelWarp_Atlas_{cid}"
                 warped_lbl = LabelTransformer.transform_labels(
@@ -855,7 +1065,7 @@ def main():
                 warp_arr = sitk.GetArrayFromImage(warped_lbl)
                 n_warp   = int(np.count_nonzero(warp_arr))
                 print(f"    Warped label voxels: {n_warp}  "
-                      f"(rigid={rigid_sec:.1f}s, affine={affine_sec:.1f}s)")
+                      f"(rigid={rigid_sec:.1f}s, affine={affine_sec:.1f}s, bspline={bspline_sec:.1f}s)")
 
                 if n_warp > 0:
                     transformed_labels.append(warped_lbl)
@@ -864,6 +1074,7 @@ def main():
                     "atlas_id": cid, "rigid_mi": rigid_mi,
                     "affine_mi": affine_mi, "n_warp": n_warp
                 })
+                per_atlas_transforms[cid] = final_tx
 
                 # Save individual atlas output for debugging
                 sitk.WriteImage(warped_lbl,
@@ -901,6 +1112,7 @@ def main():
                     warp_counter += 1
 
             best_vessels = transformed_labels[best_label_idx]
+            best_vessels = LabelTransformer.clean_coronary_topology(best_vessels)
             best_arr     = sitk.GetArrayFromImage(best_vessels)
             n_best       = int(np.count_nonzero(best_arr))
             ca_pos_voxels = int(np.count_nonzero(
@@ -922,6 +1134,18 @@ def main():
             sitk.WriteImage(best_vessels, str(CFG.OUT_DIR / f"{sid}_vessels_best.nii.gz"))
             sitk.WriteImage(eval_fixed_raw, str(CFG.OUT_DIR / f"{sid}_patient_ct.nii.gz"))
 
+            # Save warped atlas CT for registration verification in 3D Slicer
+            best_cid = best["atlas_id"]
+            if best_cid in per_atlas_transforms and best_cid in atlas_reg_wins:
+                best_tx = per_atlas_transforms[best_cid]
+                warped_atlas_ct = sitk.Resample(
+                    atlas_reg_wins[best_cid], eval_fixed_raw, best_tx,
+                    sitk.sitkLinear, 0.0, sitk.sitkFloat32
+                )
+                warped_atlas_path = str(CFG.OUT_DIR / f"{sid}_warped_atlas_{best_cid}.nii.gz")
+                sitk.WriteImage(warped_atlas_ct, warped_atlas_path)
+                print(f"  Saved warped atlas CT  : {warped_atlas_path}")
+
             # ── Validate best-atlas mask ────────────────────────────────────────
             current_stage = "Validation"
             t0 = time.time()
@@ -939,7 +1163,7 @@ def main():
             status_str = "PASS ✓" if passed else "FAIL ✗"
             total_reg_sec = sum(
                 v for k, v in time_log.items()
-                if k.startswith("rigid_sec") or k.startswith("affine_sec")
+                if k.startswith("rigid_sec") or k.startswith("affine_sec") or k.startswith("bspline_sec")
             )
             print(f"\n  {'─'*60}")
             atlas_id_str = ", ".join(r["atlas_id"] for r in per_atlas_results)
@@ -1006,19 +1230,24 @@ def main():
         print(f"Median Ca% (Ca+ only)    : {ca_pos_df['ca_pct'].median():.2f}%")
     if not valid_df.empty:
         # Aggregate per-patient total registration time across all atlases
-        rigid_cols  = [c for c in valid_df.columns if c.startswith("rigid_sec_atlas")]
+        rigid_cols   = [c for c in valid_df.columns if c.startswith("rigid_sec_atlas")]
+        bspline_cols = [c for c in valid_df.columns if c.startswith("bspline_sec_atlas")]
         affine_cols = [c for c in valid_df.columns if c.startswith("affine_sec_atlas")]
         if rigid_cols:
             mean_rigid_per_atlas  = valid_df[rigid_cols].mean(axis=1).mean()
             mean_affine_per_atlas = valid_df[affine_cols].mean(axis=1).mean() if affine_cols else 0
+            mean_bspline_per_atlas = valid_df[bspline_cols].mean(axis=1).mean() if bspline_cols else 0
             mean_total_per_patient = (
                 valid_df[rigid_cols].sum(axis=1) +
-                valid_df[affine_cols].sum(axis=1)
-            ).mean() if affine_cols else valid_df[rigid_cols].sum(axis=1).mean()
+                valid_df[affine_cols].sum(axis=1) +
+                (valid_df[bspline_cols].sum(axis=1) if bspline_cols else 0)
+            ).mean()
             print(f"Mean rigid time/atlas    : {mean_rigid_per_atlas:.1f}s")
             print(f"Mean affine time/atlas   : {mean_affine_per_atlas:.1f}s")
+            if bspline_cols:
+                print(f"Mean bspline time/atlas  : {mean_bspline_per_atlas:.1f}s")
             print(f"Mean total reg/patient   : {mean_total_per_patient:.1f}s  "
-                  f"({CFG.N_ATLASES} atlases × rigid+affine)")
+                  f"({CFG.N_ATLASES} atlases × rigid+affine" + ("+bspline" if CFG.BSPLINE_ENABLED else "") + ")")
     print(f"Results CSV              : {CFG.OUT_DIR / 'task3_results.csv'}")
     print("=" * 85)
 

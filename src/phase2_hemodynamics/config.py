@@ -65,9 +65,9 @@ class DirectoriesConfig:
     root_dir: Path = field(default_factory=lambda: Path("/Users/karan/Desktop/PrediCT"))
     data_dir: Path = field(default_factory=lambda: Path("/Users/karan/Desktop/PrediCT/approved_masks"))
     output_dir: Path = field(default_factory=lambda: Path("/Users/karan/Desktop/PrediCT/output_v2"))
-    checkpoint_dir: Path = field(default_factory=lambda: Path("/Users/karan/Desktop/PrediCT/output_v2/checkpoints"))
-    export_dir: Path = field(default_factory=lambda: Path("/Users/karan/Desktop/PrediCT/output_v2/exports"))
-    log_dir: Path = field(default_factory=lambda: Path("/Users/karan/Desktop/PrediCT/output_v2/logs"))
+    checkpoint_dir: Path = field(default_factory=lambda: Path(os.getenv("PREDICT_CHECKPOINT_DIR", "/Users/karan/Desktop/PrediCT/output_v2/checkpoints")))
+    export_dir: Path = field(default_factory=lambda: Path(os.getenv("PREDICT_EXPORT_DIR", "/Users/karan/Desktop/PrediCT/output_v2/exports")))
+    log_dir: Path = field(default_factory=lambda: Path(os.getenv("PREDICT_LOG_DIR", "/Users/karan/Desktop/PrediCT/output_v2/logs")))
 
 
 @dataclass(frozen=True)
@@ -420,7 +420,7 @@ class CurriculumConfig:
     """
     Two-stage curriculum training configuration.
     """
-    bc_pretrain_epochs: int = 5000
+    bc_pretrain_epochs: int = int(os.environ.get("PREDICT_BC_EPOCHS", min(5000, int(os.environ.get("PREDICT_EPOCHS", 50000)) // 3)))
     max_epochs: int = int(os.environ.get("PREDICT_EPOCHS", 50000))
 
 @dataclass(frozen=True)
