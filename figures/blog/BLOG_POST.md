@@ -225,10 +225,10 @@ The network is trained not on a fixed mesh, but on randomly sampled **collocatio
 
 | Region | Count | Sampling Method |
 |---|---|---|
-| **Interior** | 4,000 pts | Uniform random inside vessel mask |
-| **Wall** | 2,000 pts | Surface voxel boundary detection |
-| **Inlet** | 500 pts | Circular disk at aortic ostium |
-| **Outlet** | 500 pts/outlet | Circular disk at each branch termination |
+| **Interior** | 25,000 pts | Uniform random inside vessel mask |
+| **Wall** | 10,000 pts | Surface voxel boundary detection |
+| **Inlet** | 2,500 pts | Circular disk at aortic ostium |
+| **Outlet** | 2,500 pts/outlet | Circular disk at each branch termination |
 
 During development, these counts were calibrated to balance accuracy against memory constraints. Increasing wall points beyond 2,000 improved boundary-layer resolution for ESS but at diminishing returns for the additional GPU memory cost.
 
